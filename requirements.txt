@@ -1,8 +1,7 @@
 streamlit
-open3d
 opencv-python-headless
 numpy
 plotly
 svgwrite
-scipy
-scikit-learn
+plyfile
+pypcd
