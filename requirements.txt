@@ -1,7 +1,8 @@
 streamlit
-opencv-python-headless
 numpy
+opencv-python-headless
 plotly
+pydeck
 svgwrite
 plyfile
 pypcd
