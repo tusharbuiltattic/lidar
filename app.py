@@ -12,7 +12,7 @@ import pydeck as pdk
 
 # ==================== App config ====================
 st.set_page_config(page_title="LiDAR → Floor Plan", layout="wide")
-TITLE = "LiDAR → 2D Floor‑Plan Extractor (v3 • Demo‑only • Flashy)"
+TITLE = "LiDAR → 2D Floor‑Plan Extractor (v4 • Demo‑only • Auto‑run)"
 MAX_POINTS = 1_000_000
 SAMPLE_FOR_VIEW = 160_000
 DEFAULT_RES_M = 0.03
@@ -50,6 +50,7 @@ def add_door_gap(points, cx, cy, w, h, side="S", gap=0.9):
         keep = ~((np.abs(points[:,1]-dc[1])<rad) & (np.abs(points[:,0]-dc[0])<0.12))
     return points[keep]
 
+@st.cache_data(show_spinner=False)
 def demo_scene(name="2BHK", seed=42, noise_scale=1.0):
     rng = np.random.RandomState(seed)
     clouds = []
@@ -295,162 +296,157 @@ with st.sidebar:
     az = st.slider("Azimuth", -180, 180, 40, 5)
     el = st.slider("Elevation", 0, 90, 35, 5)
 
-    run = st.button("Run demo 🚀", type="primary", use_container_width=True)
+# ==================== Auto‑run pipeline (no button) ====================
+with st.spinner("Synthesizing demo & extracting plan…"):
+    pts = demo_scene(demo_name, seed=int(demo_seed), noise_scale=float(noise_scale))
+    orig_n = len(pts)
+    if orig_n > MAX_POINTS:
+        step = int(np.ceil(orig_n / MAX_POINTS)); pts = pts[::step]
 
-# ==================== Pipeline ====================
-if not run:
-    st.info("Pick a demo and click Run.")
+    if use_percent_roi:
+        lo = np.percentile(pts[:,:2], p_lo, axis=0)
+        hi = np.percentile(pts[:,:2], p_hi, axis=0)
+        m = (pts[:,0]>=lo[0]) & (pts[:,0]<=hi[0]) & (pts[:,1]>=lo[1]) & (pts[:,1]<=hi[1])
+        pts = pts[m]
 
-if run:
-    with st.spinner("Synthesizing demo & extracting plan…"):
-        pts = demo_scene(demo_name, seed=int(demo_seed), noise_scale=float(noise_scale))
-        orig_n = len(pts)
-        if orig_n > MAX_POINTS:
-            step = int(np.ceil(orig_n / MAX_POINTS)); pts = pts[::step]
+    pts = voxel_downsample(pts, leaf=float(voxel))
+    pts = statistical_outlier_fast(pts, cell=float(density_cell), min_pts=int(density_min))
+    _, rest = ransac_ground(pts, thresh=0.02, iters=600)
+    band = height_band(rest, zmin=float(zmin), zmax=float(zmax))
 
-        if use_percent_roi:
-            lo = np.percentile(pts[:,:2], p_lo, axis=0)
-            hi = np.percentile(pts[:,:2], p_hi, axis=0)
-            m = (pts[:,0]>=lo[0]) & (pts[:,0]<=hi[0]) & (pts[:,1]>=lo[1]) & (pts[:,1]<=hi[1])
-            pts = pts[m]
+    if auto_relax and band.shape[0] < MIN_BAND_PTS:
+        zmin2 = max(0.0, zmin - 0.05)
+        zmax2 = zmax + 0.3
+        pts2 = voxel_downsample(pts, leaf=float(voxel)*1.2)
+        pts2 = statistical_outlier_fast(pts2, cell=float(density_cell)*1.2, min_pts=max(1, int(density_min)-1))
+        _, rest2 = ransac_ground(pts2, thresh=0.03, iters=400)
+        band2 = height_band(rest2, zmin=zmin2, zmax=zmax2)
+        if band2.shape[0] > band.shape[0]:
+            band = band2
 
-        pts = voxel_downsample(pts, leaf=float(voxel))
-        pts = statistical_outlier_fast(pts, cell=float(density_cell), min_pts=int(density_min))
-        _, rest = ransac_ground(pts, thresh=0.02, iters=600)
-        band = height_band(rest, zmin=float(zmin), zmax=float(zmax))
+    if band.shape[0] < 50:
+        st.error("Too few points after filtering. Loosen filters.")
+        st.stop()
 
-        if auto_relax and band.shape[0] < MIN_BAND_PTS:
-            zmin2 = max(0.0, zmin - 0.05)
-            zmax2 = zmax + 0.3
-            pts2 = voxel_downsample(pts, leaf=float(voxel)*1.2)
-            pts2 = statistical_outlier_fast(pts2, cell=float(density_cell)*1.2, min_pts=max(1, int(density_min)-1))
-            _, rest2 = ransac_ground(pts2, thresh=0.03, iters=400)
-            band2 = height_band(rest2, zmin=zmin2, zmax=zmax2)
-            if band2.shape[0] > band.shape[0]:
-                band = band2
+    xy = band[:, :2]
+    rotation_deg = 0.0
+    if do_pca_align:
+        xy, rotation_deg = pca_align(xy)
 
-        if band.shape[0] < 50:
-            st.error("Too few points after filtering. Loosen filters."); st.stop()
+    grid, meta = to_grid(xy, res=float(res))
+    meta.rotation_deg = float(rotation_deg)
+    wall = wall_mask_from_points(grid, dil=int(dil), close=int(morph_close))
+    lines_raw, edges = extract_lines(wall, min_len_px=int(min_len), theta_res=np.pi/180, rho_res=1, thresh=int(hough_thresh), max_gap=int(max_gap))
+    lines = merge_collinear(lines_raw, angle_tol_deg=int(angle_merge), snap_ortho=bool(snap_ortho))
+    doors = detect_doors(wall, res=meta.res)
+    overlay_img = overlay(wall, lines, doors, alpha=0.75)
 
-        xy = band[:, :2]
-        rotation_deg = 0.0
-        if do_pca_align:
-            xy, rotation_deg = pca_align(xy)
+    inv = 255 - wall
+    dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+    wall_thickness_px = float(np.percentile(dist[wall>0], 90)) if np.any(wall>0) else 0.0
+    wall_thickness_m = wall_thickness_px * meta.res * 2
 
-        grid, meta = to_grid(xy, res=float(res))
-        meta.rotation_deg = float(rotation_deg)
-        wall = wall_mask_from_points(grid, dil=int(dil), close=int(morph_close))
-        lines_raw, edges = extract_lines(wall, min_len_px=int(min_len), theta_res=np.pi/180, rho_res=1, thresh=int(hough_thresh), max_gap=int(max_gap))
-        lines = merge_collinear(lines_raw, angle_tol_deg=int(angle_merge), snap_ortho=bool(snap_ortho))
-        doors = detect_doors(wall, res=meta.res)
-        overlay_img = overlay(wall, lines, doors, alpha=0.75)
+# ---------------------- Visuals (tabs) ----------------------
+t1, t2, t3 = st.tabs(["Immersive 3D", "2D Layers", "Analytics & Exports"])
 
-        inv = 255 - wall
-        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-        wall_thickness_px = float(np.percentile(dist[wall>0], 90)) if np.any(wall>0) else 0.0
-        wall_thickness_m = wall_thickness_px * meta.res * 2
+with t1:
+    c1, c2 = st.columns([1.2, 0.8])
+    with c1:
+        st.subheader("3D point cloud (interactive)")
+        samp = band[np.random.choice(len(band), size=min(SAMPLE_FOR_VIEW, len(band)), replace=False)]
+        if color_mode == "height(z)":
+            cvals = samp[:,2]
+        else:
+            xy_ = samp[:,:2]
+            res_d = max(DEFAULT_RES_M, float(res))
+            ij = np.floor((xy_ - xy_.min(0))/res_d).astype(int)
+            keys = ij[:,0]*73856093 ^ ij[:,1]*19349663
+            _, invk, cnts = np.unique(keys, return_inverse=True, return_counts=True)
+            cvals = cnts[invk]
 
-    # ---------------------- Visuals (tabs) ----------------------
-    t1, t2, t3 = st.tabs(["Immersive 3D", "2D Layers", "Analytics & Exports"])
-
-    with t1:
-        c1, c2 = st.columns([1.2, 0.8])
-        with c1:
-            st.subheader("3D point cloud (interactive)")
-            samp = band[np.random.choice(len(band), size=min(SAMPLE_FOR_VIEW, len(band)), replace=False)]
-            if color_mode == "height(z)":
-                cvals = samp[:,2]
-            else:
-                xy_ = samp[:,:2]
-                res_d = max(DEFAULT_RES_M, float(res))
-                ij = np.floor((xy_ - xy_.min(0))/res_d).astype(int)
-                keys = ij[:,0]*73856093 ^ ij[:,1]*19349663
-                _, invk, cnts = np.unique(keys, return_inverse=True, return_counts=True)
-                cvals = cnts[invk]
-
-            fig = go.Figure(data=[go.Scatter3d(
-                x=samp[:,0], y=samp[:,1], z=samp[:,2],
-                mode='markers',
-                marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
-            )])
-            cam = dict(eye=dict(x=float(np.cos(np.radians(az))*2.2), y=float(np.sin(np.radians(az))*2.2), z=float(np.sin(np.radians(el))*2.0)))
-            cam["projection"] = dict(type='perspective')
-            fig.update_layout(
-                scene=dict(
-                    xaxis_title='x', yaxis_title='y', zaxis_title='z',
-                    xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                    yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                    zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                    aspectmode='data', camera=cam
-                ),
-                margin=dict(l=0,r=0,t=0,b=0), height=560
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with c2:
-            st.subheader("Top‑down heatmap")
-            heat = cv2.GaussianBlur(wall, (0,0), 1)
-            fig_hm = px.imshow(heat, origin='upper')
-            fig_hm.update_layout(coloraxis_showscale=False, height=560, margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig_hm, use_container_width=True)
-
-    with t2:
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            st.subheader("Wall mask")
-            st.image(wall, use_container_width=True, clamp=True)
-        with colB:
-            st.subheader("Edges")
-            st.image(edges, use_container_width=True, clamp=True)
-        with colC:
-            st.subheader("Vector overlay")
-            alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.75, 0.05)
-            st.image(overlay(wall, lines, doors, alpha=float(alpha)), use_container_width=True, clamp=True)
-
-    with t3:
-        st.subheader("Metrics")
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Grid H×W (px)", f"{meta.shape[0]} × {meta.shape[1]}")
-        m2.metric("Resolution (m/px)", f"{meta.res:.3f}")
-        m3.metric("Lines", len(lines))
-        m4.metric("Doors", len(doors))
-        m5.metric("~Wall thickness (m)", f"{wall_thickness_m:.2f}")
-
-        st.caption("Rotation applied (PCA): {:.1f}°".format(meta.rotation_deg))
-        st.markdown("---")
-        st.subheader("Downloads")
-        svg_bytes = export_svg(lines, doors, meta)
-        st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml", use_container_width=True)
-        ok, png_bytes = cv2.imencode(".png", wall)
-        if ok:
-            st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png", use_container_width=True)
-        rows = ["x1_m,y1_m,x2_m,y2_m"]
-        for (x1,y1,x2,y2) in lines:
-            x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
-            y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
-            y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
-            rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-        csv_bytes = ("
-".join(rows)).encode("utf-8")
-        st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
-        gj = export_geojson(lines, doors, meta)
-        st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
-
-    # Footer ribbon + subtle gradient
-    st.markdown(
-        """
-        <style>
-          .stApp {background: linear-gradient(180deg, #0b1020 0%, #0b1020 40%, #0f172a 100%);} 
-          .stApp, .stMarkdown, .stPlotlyChart {color: #e5e7eb !important}
-        </style>
-        <div style="position:fixed;right:16px;bottom:16px;background:#111827;color:#e5e7eb;padding:8px 12px;border-radius:12px;opacity:0.9;font-size:12px;">
-          Demo‑only build • Streamlit • CV2 • Plotly
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("About this demo"):
-        st.write(
-            "This v3 build removes uploads and focuses on high‑polish demo visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
+        fig = go.Figure(data=[go.Scatter3d(
+            x=samp[:,0], y=samp[:,1], z=samp[:,2],
+            mode='markers',
+            marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
+        )])
+        cam = dict(eye=dict(x=float(np.cos(np.radians(az))*2.2), y=float(np.sin(np.radians(az))*2.2), z=float(np.sin(np.radians(el))*2.0)))
+        cam["projection"] = dict(type='perspective')
+        fig.update_layout(
+            scene=dict(
+                xaxis_title='x', yaxis_title='y', zaxis_title='z',
+                xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                aspectmode='data', camera=cam
+            ),
+            margin=dict(l=0,r=0,t=0,b=0), height=560
         )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with c2:
+        st.subheader("Top‑down heatmap")
+        heat = cv2.GaussianBlur(wall, (0,0), 1)
+        fig_hm = px.imshow(heat, origin='upper')
+        fig_hm.update_layout(coloraxis_showscale=False, height=560, margin=dict(l=0,r=0,t=0,b=0))
+        st.plotly_chart(fig_hm, use_container_width=True)
+
+with t2:
+    colA, colB, colC = st.columns([1,1,1])
+    with colA:
+        st.subheader("Wall mask")
+        st.image(wall, use_container_width=True, clamp=True)
+    with colB:
+        st.subheader("Edges")
+        st.image(edges, use_container_width=True, clamp=True)
+    with colC:
+        st.subheader("Vector overlay")
+        alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.75, 0.05)
+        st.image(overlay(wall, lines, doors, alpha=float(alpha)), use_container_width=True, clamp=True)
+
+with t3:
+    st.subheader("Metrics")
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Grid H×W (px)", f"{meta.shape[0]} × {meta.shape[1]}")
+    m2.metric("Resolution (m/px)", f"{meta.res:.3f}")
+    m3.metric("Lines", len(lines))
+    m4.metric("Doors", len(doors))
+    m5.metric("~Wall thickness (m)", f"{wall_thickness_m:.2f}")
+
+    st.caption("Rotation applied (PCA): {:.1f}°".format(meta.rotation_deg))
+    st.markdown("---")
+    st.subheader("Downloads")
+    svg_bytes = export_svg(lines, doors, meta)
+    st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml", use_container_width=True)
+    ok, png_bytes = cv2.imencode(".png", wall)
+    if ok:
+        st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png", use_container_width=True)
+    rows = ["x1_m,y1_m,x2_m,y2_m"]
+    for (x1,y1,x2,y2) in lines:
+        x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
+        y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
+        y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
+        rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
+    csv_bytes = ("
+".join(rows)).encode("utf-8")
+    st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
+    gj = export_geojson(lines, doors, meta)
+    st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
+
+# Footer ribbon + subtle gradient
+st.markdown(
+    """
+    <style>
+      .stApp {background: linear-gradient(180deg, #0b1020 0%, #0b1020 40%, #0f172a 100%);} 
+      .stApp, .stMarkdown, .stPlotlyChart {color: #e5e7eb !important}
+    </style>
+    <div style=\"position:fixed;right:16px;bottom:16px;background:#111827;color:#e5e7eb;padding:8px 12px;border-radius:12px;opacity:0.9;font-size:12px;\">
+      Demo‑only build • Streamlit • CV2 • Plotly
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+with st.expander("About this demo"):
+    st.write(
+        "This v4 build removes uploads and buttons, auto‑runs the demo, and focuses on high‑polish visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
+    )
