@@ -13,7 +13,10 @@ import pydeck as pdk
 # ==================== App config ====================
 st.set_page_config(page_title="LiDAR → Floor Plan", layout="wide")
 # Avoid creating many inotify watchers on Streamlit Cloud
-st.set_option("server.fileWatcherType", "none")
+try:
+    st.set_option("server.fileWatcherType", "poll")  # avoid inotify on some platforms
+except Exception:
+    pass
 
 TITLE = "LiDAR → 2D Floor‑Plan Extractor (v5 • Demo‑only • Auto‑run)"
 MAX_POINTS = 1_000_000
@@ -429,7 +432,8 @@ with t3:
         y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
         y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
         rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-    csv_text = "\n".join(rows)
+    csv_text = "
+".join(rows)
     csv_bytes = csv_text.encode("utf-8")
     st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
     gj = export_geojson(lines, doors, meta)
