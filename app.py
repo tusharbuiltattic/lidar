@@ -12,23 +12,11 @@ import pydeck as pdk
 
 # ==================== App config ====================
 st.set_page_config(page_title="LiDAR → Floor Plan", layout="wide")
-TITLE = "LiDAR → 2D Floor‑Plan Extractor (v2 flashy)"
+TITLE = "LiDAR → 2D Floor‑Plan Extractor (v3 • Demo‑only • Flashy)"
 MAX_POINTS = 1_000_000
-SAMPLE_FOR_VIEW = 120_000
+SAMPLE_FOR_VIEW = 160_000
 DEFAULT_RES_M = 0.03
 MIN_BAND_PTS = 400   # auto‑relax target
-
-# Optional readers
-try:
-    from plyfile import PlyData
-    HAS_PLY = True
-except Exception:
-    HAS_PLY = False
-try:
-    from pypcd import pypcd
-    HAS_PCD = True
-except Exception:
-    HAS_PCD = False
 
 # ==================== Types ====================
 @dataclass
@@ -38,96 +26,8 @@ class GridMeta:
     shape: tuple  # (H, W)
     rotation_deg: float = 0.0  # rotation applied to XY for orthogonal alignment
 
-# ==================== Utilities ====================
-def _badge(text: str, color: str = "#10b981"):
-    st.markdown(
-        f"""
-        <span style="background:{color};color:white;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px;">{text}</span>
-        """,
-        unsafe_allow_html=True,
-    )
-
-@st.cache_data(show_spinner=False)
-def _cached_demo(name: str, seed: int):
-    return demo_scene(name, seed)
-
-# ==================== IO helpers ====================
-def _to_tempfile(uploaded_file, suffix):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
-        f.write(uploaded_file.getvalue())
-        return f.name
-
-def read_pcd_ascii(f):
-    header = []
-    while True:
-        line = f.readline()
-        if not line: raise ValueError("Invalid PCD header.")
-        header.append(line.strip())
-        if line.strip().lower().startswith("data"): break
-    fields = None
-    for h in header:
-        if h.lower().startswith("fields"):
-            fields = h.split()[1:]
-    if not fields or not set(["x","y","z"]).issubset(set(fields)):
-        raise ValueError("PCD fields must include x y z.")
-    ix, iy, iz = fields.index("x"), fields.index("y"), fields.index("z")
-    pts = []
-    for line in f:
-        if not line.strip(): continue
-        p = line.strip().split()
-        pts.append([float(p[ix]), float(p[iy]), float(p[iz])])
-    return np.asarray(pts, dtype=np.float32)
-
-def load_cloud(uploaded_file):
-    name = uploaded_file.name.lower()
-    buf = uploaded_file.getvalue()
-    suffix = os.path.splitext(name)[1]
-
-    if name.endswith(".ply"):
-        if not HAS_PLY: st.error("Install `plyfile` to read .ply."); st.stop()
-        ply = PlyData.read(io.BytesIO(buf))
-        v = ply["vertex"].data
-        return np.vstack([v["x"], v["y"], v["z"]]).T.astype(np.float32)
-
-    if name.endswith(".pcd"):
-        if HAS_PCD:
-            path = _to_tempfile(uploaded_file, suffix)
-            try:
-                pc = pypcd.PointCloud.from_path(path)
-                x = pc.pc_data["x"].astype(np.float32)
-                y = pc.pc_data["y"].astype(np.float32)
-                z = pc.pc_data["z"].astype(np.float32)
-                return np.vstack([x, y, z]).T
-            except Exception as e:
-                try:
-                    return read_pcd_ascii(io.StringIO(buf.decode("utf-8")))
-                except Exception:
-                    st.error(f"PCD read failed: {e}"); st.stop()
-        else:
-            try:
-                return read_pcd_ascii(io.StringIO(buf.decode("utf-8")))
-            except Exception as e:
-                st.error(f"PCD reader not available. Error: {e}"); st.stop()
-
-    if name.endswith(".npz"):
-        arr = np.load(io.BytesIO(buf))
-        key = "points" if "points" in arr else list(arr.keys())[0]
-        return arr[key].astype(np.float32)
-
-    if name.endswith((".csv", ".txt")):
-        s = buf.decode("utf-8", errors="ignore")
-        rows = []
-        for r in csv.reader(io.StringIO(s)):
-            if len(r) < 3: continue
-            try: rows.append([float(r[0]), float(r[1]), float(r[2])])
-            except ValueError: continue
-        if not rows: st.error("CSV/TXT needs x,y,z columns."); st.stop()
-        return np.asarray(rows, dtype=np.float32)
-
-    st.error("Use .ply, .pcd, .npz, .csv, or .txt."); st.stop()
-
 # ==================== Demo generators ====================
-def rect_outline(cx, cy, w, h, zmin=0.1, zmax=2.4, n=2000, noise=0.004, rng=None):
+def rect_outline(cx, cy, w, h, zmin=0.1, zmax=2.4, n=2200, noise=0.004, rng=None):
     rng = rng or np.random.RandomState(0)
     # perimeter sampling
     t = np.linspace(0, 1, n, endpoint=False)
@@ -150,12 +50,12 @@ def add_door_gap(points, cx, cy, w, h, side="S", gap=0.9):
         keep = ~((np.abs(points[:,1]-dc[1])<rad) & (np.abs(points[:,0]-dc[0])<0.12))
     return points[keep]
 
-def demo_scene(name="2BHK", seed=42):
+def demo_scene(name="2BHK", seed=42, noise_scale=1.0):
     rng = np.random.RandomState(seed)
     clouds = []
     if name == "Studio":
         cx, cy, w, h = 0.0, 0.0, 6.0, 5.0
-        R = rect_outline(cx, cy, w, h, rng=rng)
+        R = rect_outline(cx, cy, w, h, rng=rng, noise=0.004*noise_scale)
         R = add_door_gap(R, cx, cy, w, h, side="S", gap=0.9)
         clouds.append(R)
     elif name == "2BHK":
@@ -164,7 +64,7 @@ def demo_scene(name="2BHK", seed=42):
                  ( 0.2, 3.7, 10.2, 4.0, "N"),
                  ( 0.0,-3.2, 10.2, 2.0, "S")]
         for (cx,cy,w,h,side) in specs:
-            R = rect_outline(cx, cy, w, h, rng=rng)
+            R = rect_outline(cx, cy, w, h, rng=rng, noise=0.004*noise_scale)
             R = add_door_gap(R, cx, cy, w, h, side=side, gap=0.9)
             clouds.append(R)
     else:  # Corridor network
@@ -173,7 +73,7 @@ def demo_scene(name="2BHK", seed=42):
                  (-8.5, 2.0, 2.5, 7.0, "S"),
                  ( 8.5, 2.0, 2.5, 7.0, "N")]
         for (cx,cy,w,h,side) in specs:
-            R = rect_outline(cx, cy, w, h, rng=rng, noise=0.006)
+            R = rect_outline(cx, cy, w, h, rng=rng, noise=0.006*noise_scale)
             R = add_door_gap(R, cx, cy, w, h, side=side, gap=1.0)
             clouds.append(R)
     return np.concatenate(clouds, axis=0)
@@ -214,7 +114,7 @@ def height_band(pts, zmin=0.1, zmax=2.4):
     m = (pts[:,2] >= zmin) & (pts[:,2] <= zmax)
     return pts[m]
 
-# ----- New: PCA alignment (orthogonal snap) -----
+# ----- PCA alignment (orthogonal snap) -----
 def pca_align(xy: np.ndarray) -> Tuple[np.ndarray, float]:
     """Rotate XY so the first PC aligns with X axis; returns (rotated_xy, angle_deg)."""
     xy0 = xy - xy.mean(0, keepdims=True)
@@ -268,7 +168,6 @@ def merge_collinear(lines: List[Tuple[int,int,int,int]], angle_tol_deg=5, snap_o
     for i,l in enumerate(lines):
         if used[i]: continue
         ag = angle(l)
-        # optional snapping to 0/90
         if snap_ortho:
             ag = 0 if min(abs(ag-0), abs(ag-180)) < 45 else 90
         pts=[(l[0],l[1]),(l[2],l[3])]; used[i]=True
@@ -280,7 +179,6 @@ def merge_collinear(lines: List[Tuple[int,int,int,int]], angle_tol_deg=5, snap_o
             if min(abs(am-ag), abs(abs(am-ag)-180)) <= angle_tol_deg:
                 pts += [(m[0],m[1]),(m[2],m[3])]; used[j]=True
         xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
-        # orientation proxy
         if abs(math.sin(math.radians(ag))) < 0.5:
             ymed=int(np.median(ys)); merged.append((min(xs), ymed, max(xs), ymed))
         else:
@@ -320,7 +218,7 @@ def px_to_m(p, meta: GridMeta):
 def export_svg(lines, doors, meta: GridMeta):
     H, W = meta.shape
     vb_w, vb_h = W*meta.res, H*meta.res
-    dwg = svgwrite.Drawing(size=("1000px","1000px"), viewBox=f"0 0 {vb_w:.3f} {vb_h:.3f}")
+    dwg = svgwrite.Drawing(size=("1200px","1200px"), viewBox=f"0 0 {vb_w:.3f} {vb_h:.3f}")
     dwg.add(dwg.rect(insert=(0,0), size=(vb_w, vb_h), fill="white"))
     layer_walls = dwg.add(dwg.g(id="WALLS", stroke="black", fill="none", stroke_width=0.02))
     for (x1,y1,x2,y2) in lines:
@@ -336,7 +234,7 @@ def export_svg(lines, doors, meta: GridMeta):
         layer_doors.add(dwg.circle(center=(xm, ym), r=r))
     return dwg.tostring().encode("utf-8")
 
-# ======= NEW: GeoJSON export for walls & doors =======
+# ======= GeoJSON export for walls & doors =======
 def export_geojson(lines, doors, meta: GridMeta) -> Dict:
     feats = []
     for (x1,y1,x2,y2) in lines:
@@ -358,31 +256,13 @@ def export_geojson(lines, doors, meta: GridMeta) -> Dict:
         })
     return {"type":"FeatureCollection","features":feats}
 
-# ==================== Sidebar (flashy) ====================
+# ==================== Sidebar (Demo‑only) ====================
 st.title(TITLE)
 with st.sidebar:
-    st.header("Data")
-    source_col1, source_col2 = st.columns([1,1])
-    with source_col1:
-        mode = st.radio("Source", ["Upload", "Demo"], index=1, horizontal=True)
-    with source_col2:
-        theme = st.selectbox("Theme", ["Auto","Light","Dark"], index=0)
-    if theme == "Light":
-        st.markdown("""
-        <style>body{--bg:#ffffff}</style>
-        """, unsafe_allow_html=True)
-    elif theme == "Dark":
-        st.markdown("""
-        <style>:root{color-scheme:dark;}</style>
-        """, unsafe_allow_html=True)
-
-    if mode == "Upload":
-        up = st.file_uploader("Point cloud", type=["ply","pcd","npz","csv","txt"], accept_multiple_files=False)
-        if up is None:
-            st.info("Choose a file to enable Run.")
-    else:
-        demo_name = st.selectbox("Demo scene", ["Studio", "2BHK", "Corridor network"], index=1)
-        demo_seed = st.number_input("Seed", 0, 9999, 42)
+    st.header("Demo Data 🎛️")
+    demo_name = st.selectbox("Scene", ["Studio", "2BHK", "Corridor network"], index=1)
+    demo_seed = st.number_input("Seed", 0, 9999, 42)
+    noise_scale = st.slider("Noise scale", 0.5, 2.0, 1.0, 0.1)
 
     st.header("Preprocess")
     preset = st.selectbox("Presets", ["Default","WallsDense","Loose"], index=0,
@@ -409,46 +289,37 @@ with st.sidebar:
     angle_merge = st.slider("Merge angle tol (deg)", 1, 15, 5, 1)
     snap_ortho = st.checkbox("Snap merge to 0/90°", value=True)
 
-    st.header("3D View")
+    st.header("3D View ✨")
     engine = st.selectbox("Engine", ["Plotly", "PyDeck"], index=0)
-    point_size = st.slider("Point size", 1, 8, 2, 1)
+    point_size = st.slider("Point size", 1, 10, 3, 1)
     color_mode = st.selectbox("Color by", ["height(z)", "density"], index=0)
+    az = st.slider("Azimuth", -180, 180, 40, 5)
+    el = st.slider("Elevation", 0, 90, 35, 5)
 
-    run = st.button("Run pipeline 🚀", type="primary", use_container_width=True)
+    run = st.button("Run demo 🚀", type="primary", use_container_width=True)
 
 # ==================== Pipeline ====================
-if mode == "Upload" and not run:
-    st.info("Upload a file and click Run.")
-elif mode == "Demo" and not run:
+if not run:
     st.info("Pick a demo and click Run.")
 
 if run:
-    with st.spinner("Preparing data…"):
-        if mode == "Upload":
-            if "up" not in locals() or up is None:
-                st.error("No file selected."); st.stop()
-            pts = load_cloud(up)
-        else:
-            pts = _cached_demo(demo_name, int(demo_seed))
-        if pts.ndim != 2 or pts.shape[1] < 3: st.error("Expect Nx3 points [x,y,z]."); st.stop()
+    with st.spinner("Synthesizing demo & extracting plan…"):
+        pts = demo_scene(demo_name, seed=int(demo_seed), noise_scale=float(noise_scale))
         orig_n = len(pts)
         if orig_n > MAX_POINTS:
             step = int(np.ceil(orig_n / MAX_POINTS)); pts = pts[::step]
 
-        # ROI crop (percentile window in XY)
         if use_percent_roi:
             lo = np.percentile(pts[:,:2], p_lo, axis=0)
             hi = np.percentile(pts[:,:2], p_hi, axis=0)
             m = (pts[:,0]>=lo[0]) & (pts[:,0]<=hi[0]) & (pts[:,1]>=lo[1]) & (pts[:,1]<=hi[1])
             pts = pts[m]
 
-        # preprocess
         pts = voxel_downsample(pts, leaf=float(voxel))
         pts = statistical_outlier_fast(pts, cell=float(density_cell), min_pts=int(density_min))
         _, rest = ransac_ground(pts, thresh=0.02, iters=600)
         band = height_band(rest, zmin=float(zmin), zmax=float(zmax))
 
-        # auto relax if too sparse
         if auto_relax and band.shape[0] < MIN_BAND_PTS:
             zmin2 = max(0.0, zmin - 0.05)
             zmax2 = zmax + 0.3
@@ -463,7 +334,6 @@ if run:
             st.error("Too few points after filtering. Loosen filters."); st.stop()
 
         xy = band[:, :2]
-
         rotation_deg = 0.0
         if do_pca_align:
             xy, rotation_deg = pca_align(xy)
@@ -474,27 +344,24 @@ if run:
         lines_raw, edges = extract_lines(wall, min_len_px=int(min_len), theta_res=np.pi/180, rho_res=1, thresh=int(hough_thresh), max_gap=int(max_gap))
         lines = merge_collinear(lines_raw, angle_tol_deg=int(angle_merge), snap_ortho=bool(snap_ortho))
         doors = detect_doors(wall, res=meta.res)
-        overlay_img = overlay(wall, lines, doors, alpha=0.7)
+        overlay_img = overlay(wall, lines, doors, alpha=0.75)
 
-        # thickness estimate via distance transform
         inv = 255 - wall
         dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
         wall_thickness_px = float(np.percentile(dist[wall>0], 90)) if np.any(wall>0) else 0.0
         wall_thickness_m = wall_thickness_px * meta.res * 2
 
     # ---------------------- Visuals (tabs) ----------------------
-    t1, t2, t3 = st.tabs(["3D / Top‑down", "2D Layers", "Analytics & Exports"])
+    t1, t2, t3 = st.tabs(["Immersive 3D", "2D Layers", "Analytics & Exports"])
 
     with t1:
-        col1, col2 = st.columns([1,1])
-        with col1:
-            st.subheader("3D view")
-            # sample for speed
+        c1, c2 = st.columns([1.2, 0.8])
+        with c1:
+            st.subheader("3D point cloud (interactive)")
             samp = band[np.random.choice(len(band), size=min(SAMPLE_FOR_VIEW, len(band)), replace=False)]
             if color_mode == "height(z)":
                 cvals = samp[:,2]
             else:
-                # density by 2D binning
                 xy_ = samp[:,:2]
                 res_d = max(DEFAULT_RES_M, float(res))
                 ij = np.floor((xy_ - xy_.min(0))/res_d).astype(int)
@@ -502,42 +369,28 @@ if run:
                 _, invk, cnts = np.unique(keys, return_inverse=True, return_counts=True)
                 cvals = cnts[invk]
 
-            if engine == "Plotly":
-                fig = go.Figure(data=[go.Scatter3d(
-                    x=samp[:,0], y=samp[:,1], z=samp[:,2],
-                    mode='markers',
-                    marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.9, colorbar=dict(len=0.6))
-                )])
-                fig.update_layout(scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
-                                             aspectmode='data'),
-                                  margin=dict(l=0,r=0,t=0,b=0), height=520)
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                # PyDeck PointCloudLayer with z-based color
-                z = cvals.astype(float)
-                zmin_, zmax_ = float(z.min()), float(z.max()) if z.size else (0.0, 1.0)
-                if zmax_ == zmin_: zmax_ = zmin_ + 1.0
-                zn = (z - zmin_) / (zmax_ - zmin_ + 1e-9)
-                colors = np.stack([(zn*255).astype(int), (1-zn)*255, np.full_like(zn, 180, dtype=int)], axis=1)
-                data = [{"position":[float(x),float(y),float(zv)], "color":[int(r),int(g),int(b)]}
-                        for (x,y,zv),(r,g,b) in zip(samp, colors)]
-                layer = pdk.Layer("PointCloudLayer", data=data, get_position="position",
-                                  get_color="color", point_size=point_size, pickable=False)
-                deck = pdk.Deck(layers=[layer],
-                                initial_view_state=pdk.ViewState(x=0, y=0, z=0, zoom=0.5, pitch=45),
-                                map_provider=None)
-                st.pydeck_chart(deck, use_container_width=True)
+            fig = go.Figure(data=[go.Scatter3d(
+                x=samp[:,0], y=samp[:,1], z=samp[:,2],
+                mode='markers',
+                marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
+            )])
+            cam = dict(eye=dict(x=np.cos(np.radians(az))*2.2, y=np.sin(np.radians(az))*2.2, z=np.sin(np.radians(el))*2.0))
+            fig.update_layout(
+                scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
+                           xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                           yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                           zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                           aspectmode='data', camera=cam, projection=dict(type='perspective')),
+                margin=dict(l=0,r=0,t=0,b=0), height=560
+            )
+            st.plotly_chart(fig, use_container_width=True)
 
-            st.caption(f"Loaded: {orig_n:,} pts → kept: {pts.shape[0]:,}. Band used: {band.shape[0]:,}.")
-
-        with col2:
-            st.subheader("Top‑down scatter (interactive)")
-            # Use aligned XY if PCA alignment is enabled; otherwise original XY band
-            xy_show = xy
-            fig2 = px.scatter(x=xy_show[:,0], y=xy_show[:,1], render_mode="webgl", opacity=0.7)
-            fig2.update_traces(marker=dict(size=2))
-            fig2.update_layout(xaxis_title="x (m)", yaxis_title="y (m)", height=520, margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig2, use_container_width=True)
+        with c2:
+            st.subheader("Top‑down heatmap")
+            heat = cv2.GaussianBlur(wall, (0,0), 1)
+            fig_hm = px.imshow(heat, origin='upper')
+            fig_hm.update_layout(coloraxis_showscale=False, height=560, margin=dict(l=0,r=0,t=0,b=0))
+            st.plotly_chart(fig_hm, use_container_width=True)
 
     with t2:
         colA, colB, colC = st.columns([1,1,1])
@@ -549,7 +402,7 @@ if run:
             st.image(edges, use_container_width=True, clamp=True)
         with colC:
             st.subheader("Vector overlay")
-            alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.7, 0.05)
+            alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.75, 0.05)
             st.image(overlay(wall, lines, doors, alpha=float(alpha)), use_container_width=True, clamp=True)
 
     with t3:
@@ -562,17 +415,13 @@ if run:
         m5.metric("~Wall thickness (m)", f"{wall_thickness_m:.2f}")
 
         st.caption("Rotation applied (PCA): {:.1f}°".format(meta.rotation_deg))
-
         st.markdown("---")
         st.subheader("Downloads")
-        # SVG
         svg_bytes = export_svg(lines, doors, meta)
         st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml", use_container_width=True)
-        # Wall PNG
         ok, png_bytes = cv2.imencode(".png", wall)
         if ok:
             st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png", use_container_width=True)
-        # Lines CSV
         rows = ["x1_m,y1_m,x2_m,y2_m"]
         for (x1,y1,x2,y2) in lines:
             x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
@@ -580,29 +429,18 @@ if run:
             y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
             rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
         st.download_button("Download wall lines CSV", data=("\n".join(rows)).encode("utf-8"), file_name="walls.csv", mime="text/csv", use_container_width=True)
-        # GeoJSON
         gj = export_geojson(lines, doors, meta)
         st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
 
-        st.markdown("---")
-        st.subheader("Analytics")
-        with st.expander("Height histogram (band)"):
-            hist = np.histogram(band[:,2], bins=40)
-            fig_h = go.Figure(data=[go.Bar(x=(hist[1][:-1]+hist[1][1:])/2, y=hist[0])])
-            fig_h.update_layout(xaxis_title="z (m)", yaxis_title="count", height=260, margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig_h, use_container_width=True)
-        with st.expander("Occupancy heatmap"):
-            H, W = meta.shape
-            heat = cv2.GaussianBlur(wall, (0,0), 1)
-            fig_hm = px.imshow(heat, origin='upper')
-            fig_hm.update_layout(coloraxis_showscale=False, height=300, margin=dict(l=0,r=0,t=0,b=0))
-            st.plotly_chart(fig_hm, use_container_width=True)
-
-    # Footer ribbon
+    # Footer ribbon + subtle gradient
     st.markdown(
         """
+        <style>
+          .stApp {background: linear-gradient(180deg, #0b1020 0%, #0b1020 40%, #0f172a 100%);} 
+          .stApp, .stMarkdown, .stPlotlyChart {color: #e5e7eb !important}
+        </style>
         <div style="position:fixed;right:16px;bottom:16px;background:#111827;color:#e5e7eb;padding:8px 12px;border-radius:12px;opacity:0.9;font-size:12px;">
-          Built with ❤️ Streamlit • CV2 • Plotly • PyDeck
+          Demo‑only build • Streamlit • CV2 • Plotly
         </div>
         """,
         unsafe_allow_html=True,
@@ -610,5 +448,5 @@ if run:
 
     with st.expander("About this demo"):
         st.write(
-            "This flashy v2 adds PCA alignment, ROI cropping, better morphology controls, analytics, GeoJSON export, and interactive tabs."
+            "This v3 build removes uploads and focuses on high‑polish demo visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
         )
