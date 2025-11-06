@@ -290,7 +290,6 @@ with st.sidebar:
     snap_ortho = st.checkbox("Snap merge to 0/90°", value=True)
 
     st.header("3D View ✨")
-    engine = st.selectbox("Engine", ["Plotly", "PyDeck"], index=0)
     point_size = st.slider("Point size", 1, 10, 3, 1)
     color_mode = st.selectbox("Color by", ["height(z)", "density"], index=0)
     az = st.slider("Azimuth", -180, 180, 40, 5)
@@ -374,14 +373,16 @@ if run:
                 mode='markers',
                 marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
             )])
-            cam = dict(eye=dict(x=np.cos(np.radians(az))*2.2, y=np.sin(np.radians(az))*2.2, z=np.sin(np.radians(el))*2.0))
+            cam = dict(eye=dict(x=float(np.cos(np.radians(az))*2.2), y=float(np.sin(np.radians(az))*2.2), z=float(np.sin(np.radians(el))*2.0)))
             cam["projection"] = dict(type='perspective')
             fig.update_layout(
-                scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
-                           xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                           yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                           zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                           aspectmode='data', camera=cam),
+                scene=dict(
+                    xaxis_title='x', yaxis_title='y', zaxis_title='z',
+                    xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                    yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                    zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
+                    aspectmode='data', camera=cam
+                ),
                 margin=dict(l=0,r=0,t=0,b=0), height=560
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -429,8 +430,9 @@ if run:
             y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
             y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
             rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-        st.download_button("Download wall lines CSV", data=("
-".join(rows)).encode("utf-8"), file_name="walls.csv", mime="text/csv", use_container_width=True)
+        csv_bytes = ("
+".join(rows)).encode("utf-8")
+        st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
         gj = export_geojson(lines, doors, meta)
         st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
 
@@ -452,5 +454,3 @@ if run:
         st.write(
             "This v3 build removes uploads and focuses on high‑polish demo visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
         )
-
-
