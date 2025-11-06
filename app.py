@@ -452,3 +452,5 @@ if run:
         st.write(
             "This v3 build removes uploads and focuses on high‑polish demo visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
         )
+
+
