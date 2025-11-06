@@ -18,7 +18,7 @@ try:
 except Exception:
     pass
 
-TITLE = "LiDAR → 2D Floor‑Plan Extractor (v5 • Demo‑only • Auto‑run)"
+TITLE = "LiDAR → 2D Floor‑Plan Extractor (v6 • Demo‑only • Auto‑run)"
 MAX_POINTS = 1_000_000
 SAMPLE_FOR_VIEW = 160_000
 DEFAULT_RES_M = 0.03
@@ -227,6 +227,18 @@ def export_svg(lines, doors, meta: GridMeta):
     vb_w, vb_h = W*meta.res, H*meta.res
     dwg = svgwrite.Drawing(size=("1200px","1200px"), viewBox=f"0 0 {vb_w:.3f} {vb_h:.3f}")
     dwg.add(dwg.rect(insert=(0,0), size=(vb_w, vb_h), fill="white"))
+    # Grid/scale layer
+    grid_layer = dwg.add(dwg.g(id="GRID", stroke="#ddd", fill="none", stroke_width=0.005))
+    step = max(0.5, round(1.0 / max(0.5, int(1.0/meta.res))) )  # simple approx grid step in meters
+    x=0
+    while x < vb_w:
+        grid_layer.add(dwg.line(start=(x,0), end=(x,vb_h)))
+        x += step
+    y=0
+    while y < vb_h:
+        grid_layer.add(dwg.line(start=(0,y), end=(vb_w,y)))
+        y += step
+
     layer_walls = dwg.add(dwg.g(id="WALLS", stroke="black", fill="none", stroke_width=0.02))
     for (x1,y1,x2,y2) in lines:
         x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
@@ -239,10 +251,17 @@ def export_svg(lines, doors, meta: GridMeta):
         ym = meta.origin_xy[1] + (meta.shape[0]-cy)*meta.res
         r = max(0.05, span*meta.res*0.3)
         layer_doors.add(dwg.circle(center=(xm, ym), r=r))
+
+    # scale bar
+    sb_len_m = 1.0
+    sb_x, sb_y = 0.5, 0.5
+    dwg.add(dwg.line(start=(sb_x, sb_y), end=(sb_x+sb_len_m, sb_y), stroke="#111", stroke_width=0.05))
+    dwg.add(dwg.text(f"{sb_len_m} m", insert=(sb_x+sb_len_m+0.1, sb_y+0.1), font_size=0.2, fill="#111"))
+
     return dwg.tostring().encode("utf-8")
 
 # ======= GeoJSON export for walls & doors =======
-def export_geojson(lines, doors, meta: GridMeta) -> Dict:
+def export_geojson(lines, doors, meta: GridMeta, rooms: List[Dict]=None) -> Dict:
     feats = []
     for (x1,y1,x2,y2) in lines:
         x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
@@ -261,7 +280,38 @@ def export_geojson(lines, doors, meta: GridMeta) -> Dict:
             "properties":{"type":"door","span_m": float(span*meta.res)},
             "geometry":{"type":"Point","coordinates":[xm,ym]}
         })
+    if rooms:
+        for r in rooms:
+            feats.append({
+                "type":"Feature",
+                "properties":{"type":"room","area_m2": r.get("area_m2", None)},
+                "geometry":{"type":"Polygon","coordinates":[r["coords"]]}
+            })
     return {"type":"FeatureCollection","features":feats}
+
+# ======= Simple room polygonization (contours of free space) =======
+def detect_rooms(wall_mask: np.ndarray, meta: GridMeta, min_area_m2: float = 2.0, approx_eps_px: int = 6) -> List[Dict]:
+    inv = 255 - wall_mask
+    # fill small holes then find contours
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
+    inv = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, k, iterations=1)
+    contours, _ = cv2.findContours(inv, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    rooms = []
+    for c in contours:
+        area_px = cv2.contourArea(c)
+        area_m2 = area_px * (meta.res ** 2)
+        if area_m2 < min_area_m2:
+            continue
+        approx = cv2.approxPolyDP(c, epsilon=approx_eps_px, closed=True)
+        # Convert to meters and flip Y like in SVG export
+        poly = []
+        for pt in approx.reshape(-1,2):
+            x,y = int(pt[0]), int(pt[1])
+            xm, ym = px_to_m((x,y), meta)
+            ym = meta.origin_xy[1] + (meta.shape[0]-y)*meta.res
+            poly.append([float(xm), float(ym)])
+        rooms.append({"area_m2": float(area_m2), "coords": poly})
+    return rooms
 
 # ==================== Sidebar (Demo‑only) ====================
 st.title(TITLE)
@@ -299,6 +349,7 @@ with st.sidebar:
     st.header("3D View ✨")
     point_size = st.slider("Point size", 1, 10, 3, 1)
     color_mode = st.selectbox("Color by", ["height(z)", "density"], index=0)
+    cam_preset = st.selectbox("Camera", ["Isometric","Top","Front","Side"], index=0)
     az = st.slider("Azimuth", -180, 180, 40, 5)
     el = st.slider("Elevation", 0, 90, 35, 5)
 
@@ -352,6 +403,9 @@ with st.spinner("Synthesizing demo & extracting plan…"):
     wall_thickness_px = float(np.percentile(dist[wall>0], 90)) if np.any(wall>0) else 0.0
     wall_thickness_m = wall_thickness_px * meta.res * 2
 
+    # room polygons
+    rooms = detect_rooms(wall, meta, min_area_m2=2.0, approx_eps_px=6)
+
 # ---------------------- Visuals (tabs) ----------------------
 t1, t2, t3 = st.tabs(["Immersive 3D", "2D Layers", "Analytics & Exports"])
 
@@ -370,12 +424,22 @@ with t1:
             _, invk, cnts = np.unique(keys, return_inverse=True, return_counts=True)
             cvals = cnts[invk]
 
+        # camera presets
+        if cam_preset == "Top":
+            az_eff, el_eff = 0, 90
+        elif cam_preset == "Front":
+            az_eff, el_eff = 0, 10
+        elif cam_preset == "Side":
+            az_eff, el_eff = 90, 10
+        else:  # Isometric
+            az_eff, el_eff = az, el
+
         fig = go.Figure(data=[go.Scatter3d(
             x=samp[:,0], y=samp[:,1], z=samp[:,2],
             mode='markers',
             marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
         )])
-        cam = dict(eye=dict(x=float(np.cos(np.radians(az))*2.2), y=float(np.sin(np.radians(az))*2.2), z=float(np.sin(np.radians(el))*2.0)))
+        cam = dict(eye=dict(x=float(np.cos(np.radians(az_eff))*2.2), y=float(np.sin(np.radians(az_eff))*2.2), z=float(np.sin(np.radians(el_eff))*2.0)))
         cam["projection"] = dict(type='perspective')
         fig.update_layout(
             scene=dict(
@@ -392,7 +456,15 @@ with t1:
     with c2:
         st.subheader("Top‑down heatmap")
         heat = cv2.GaussianBlur(wall, (0,0), 1)
-        fig_hm = px.imshow(heat, origin='upper')
+        if rooms:
+            # overlay room contours
+            heat_col = cv2.cvtColor(heat, cv2.COLOR_GRAY2BGR)
+            for r in rooms:
+                pts = np.array([[int((x - meta.origin_xy[0]) / meta.res), int(meta.shape[0] - (y - meta.origin_xy[1]) / meta.res)] for (x,y) in r["coords"]], dtype=np.int32)
+                cv2.polylines(heat_col, [pts], isClosed=True, color=(0,255,255), thickness=2)
+            fig_hm = px.imshow(heat_col, origin='upper')
+        else:
+            fig_hm = px.imshow(heat, origin='upper')
         fig_hm.update_layout(coloraxis_showscale=False, height=560, margin=dict(l=0,r=0,t=0,b=0))
         st.plotly_chart(fig_hm, use_container_width=True)
 
@@ -418,26 +490,55 @@ with t3:
     m4.metric("Doors", len(doors))
     m5.metric("~Wall thickness (m)", f"{wall_thickness_m:.2f}")
 
-    st.caption("Rotation applied (PCA): {:.1f}°".format(meta.rotation_deg))
+    # Door stats and room list
+    door_spans_m = [round(d[2]*meta.res, 2) for d in doors]
+    st.write({
+        "camera_rotation_deg": round(meta.rotation_deg, 1),
+        "door_count": len(doors),
+        "door_spans_m": door_spans_m,
+        "room_count": len(rooms),
+        "room_areas_m2": [round(r["area_m2"], 2) for r in rooms],
+    })
+
     st.markdown("---")
     st.subheader("Downloads")
+    # SVG
     svg_bytes = export_svg(lines, doors, meta)
     st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml", use_container_width=True)
+    # PNGs
     ok, png_bytes = cv2.imencode(".png", wall)
     if ok:
         st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png", use_container_width=True)
+    ok2, overlay_png = cv2.imencode(".png", overlay_img)
+    if ok2:
+        st.download_button("Download overlay PNG", data=overlay_png.tobytes(), file_name="overlay.png", mime="image/png", use_container_width=True)
+
+    # CSV (walls)
     rows = ["x1_m,y1_m,x2_m,y2_m"]
     for (x1,y1,x2,y2) in lines:
         x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
         y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
         y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
         rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-    csv_text = "
-".join(rows)
+    csv_text = "\n".join(rows)
     csv_bytes = csv_text.encode("utf-8")
     st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
-    gj = export_geojson(lines, doors, meta)
-    st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
+
+    # GeoJSON (walls+doors+rooms)
+    gj = export_geojson(lines, doors, meta, rooms=rooms)
+    gj_bytes = json.dumps(gj, indent=2).encode("utf-8")
+    st.download_button("Download GeoJSON", data=gj_bytes, file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
+
+    # Metrics JSON
+    metrics = {
+        "grid_size_px": meta.shape,
+        "grid_resolution_m_per_px": meta.res,
+        "lines_detected": len(lines),
+        "door_candidates": len(doors),
+        "door_spans_m": door_spans_m,
+        "rooms": rooms,
+    }
+    st.download_button("Download metrics JSON", data=json.dumps(metrics, indent=2).encode("utf-8"), file_name="metrics.json", mime="application/json", use_container_width=True)
 
 # Footer ribbon + subtle gradient
 st.markdown(
@@ -455,5 +556,5 @@ st.markdown(
 
 with st.expander("About this demo"):
     st.write(
-        "This v5 build removes uploads and buttons, auto‑runs the demo, disables file watchers to avoid inotify limits, and focuses on high‑polish visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
+        "This v6 build removes uploads and buttons, auto‑runs the demo, disables file watchers to avoid inotify limits, adds camera presets, grid/scale in SVG, room polygonization & area stats, overlay PNG export, and GeoJSON with rooms."
     )
