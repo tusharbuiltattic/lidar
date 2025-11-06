@@ -375,12 +375,13 @@ if run:
                 marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.92, colorbar=dict(len=0.5))
             )])
             cam = dict(eye=dict(x=np.cos(np.radians(az))*2.2, y=np.sin(np.radians(az))*2.2, z=np.sin(np.radians(el))*2.0))
+            cam["projection"] = dict(type='perspective')
             fig.update_layout(
                 scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
                            xaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
                            yaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
                            zaxis=dict(showbackground=True, backgroundcolor='rgba(0,0,0,0.02)', gridcolor='rgba(0,0,0,0.2)'),
-                           aspectmode='data', camera=cam, projection=dict(type='perspective')),
+                           aspectmode='data', camera=cam),
                 margin=dict(l=0,r=0,t=0,b=0), height=560
             )
             st.plotly_chart(fig, use_container_width=True)
@@ -428,7 +429,8 @@ if run:
             y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
             y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
             rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-        st.download_button("Download wall lines CSV", data=("\n".join(rows)).encode("utf-8"), file_name="walls.csv", mime="text/csv", use_container_width=True)
+        st.download_button("Download wall lines CSV", data=("
+".join(rows)).encode("utf-8"), file_name="walls.csv", mime="text/csv", use_container_width=True)
         gj = export_geojson(lines, doors, meta)
         st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
 
