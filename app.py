@@ -1,19 +1,22 @@
-import io, os, csv, math, tempfile
+import io, os, csv, math, json, tempfile
 from dataclasses import dataclass
+from typing import List, Tuple, Dict
+
 import numpy as np
 import streamlit as st
 import plotly.graph_objects as go
+import plotly.express as px
 import cv2
 import svgwrite
 import pydeck as pdk
 
-# ---------------- App config ----------------
+# ==================== App config ====================
 st.set_page_config(page_title="LiDAR → Floor Plan", layout="wide")
-TITLE = "LiDAR → 2D Floor-Plan Extractor"
+TITLE = "LiDAR → 2D Floor‑Plan Extractor (v2 flashy)"
 MAX_POINTS = 1_000_000
 SAMPLE_FOR_VIEW = 120_000
 DEFAULT_RES_M = 0.03
-MIN_BAND_PTS = 400   # auto-relax target
+MIN_BAND_PTS = 400   # auto‑relax target
 
 # Optional readers
 try:
@@ -27,14 +30,28 @@ try:
 except Exception:
     HAS_PCD = False
 
-# ---------------- Types ----------------
+# ==================== Types ====================
 @dataclass
 class GridMeta:
     origin_xy: np.ndarray
     res: float
     shape: tuple  # (H, W)
+    rotation_deg: float = 0.0  # rotation applied to XY for orthogonal alignment
 
-# ---------------- IO helpers ----------------
+# ==================== Utilities ====================
+def _badge(text: str, color: str = "#10b981"):
+    st.markdown(
+        f"""
+        <span style="background:{color};color:white;padding:2px 8px;border-radius:999px;font-size:12px;margin-right:6px;">{text}</span>
+        """,
+        unsafe_allow_html=True,
+    )
+
+@st.cache_data(show_spinner=False)
+def _cached_demo(name: str, seed: int):
+    return demo_scene(name, seed)
+
+# ==================== IO helpers ====================
 def _to_tempfile(uploaded_file, suffix):
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as f:
         f.write(uploaded_file.getvalue())
@@ -67,7 +84,7 @@ def load_cloud(uploaded_file):
     suffix = os.path.splitext(name)[1]
 
     if name.endswith(".ply"):
-        if not HAS_PLY: st.error("Install `plyfile`."); st.stop()
+        if not HAS_PLY: st.error("Install `plyfile` to read .ply."); st.stop()
         ply = PlyData.read(io.BytesIO(buf))
         v = ply["vertex"].data
         return np.vstack([v["x"], v["y"], v["z"]]).T.astype(np.float32)
@@ -109,7 +126,7 @@ def load_cloud(uploaded_file):
 
     st.error("Use .ply, .pcd, .npz, .csv, or .txt."); st.stop()
 
-# ---------------- Demo generators ----------------
+# ==================== Demo generators ====================
 def rect_outline(cx, cy, w, h, zmin=0.1, zmax=2.4, n=2000, noise=0.004, rng=None):
     rng = rng or np.random.RandomState(0)
     # perimeter sampling
@@ -119,7 +136,7 @@ def rect_outline(cx, cy, w, h, zmin=0.1, zmax=2.4, n=2000, noise=0.004, rng=None
     x[:q] = cx - w/2 + t[:q]*w;          y[:q] = cy - h/2
     x[q:2*q] = cx + w/2;                 y[q:2*q] = cy - h/2 + (t[:q])*h
     x[2*q:3*q] = cx + w/2 - (t[:q])*w;   y[2*q:3*q] = cy + h/2
-    x[3*q:] = cx - w/2;                  y[3*q:] = cy + h/2 - (t[:n-3*q])*h
+    x[3*q:] = cx - w/2;                  y[3*q:] = cy + h/2 - (t[:len(t)-3*q])*h
     z = rng.uniform(zmin, zmax, size=n)
     xy = np.stack([x, y], axis=1) + rng.normal(0, noise, size=(n,2))
     return np.column_stack([xy, z])
@@ -161,7 +178,7 @@ def demo_scene(name="2BHK", seed=42):
             clouds.append(R)
     return np.concatenate(clouds, axis=0)
 
-# ---------------- Geometry ----------------
+# ==================== Geometry ====================
 def voxel_downsample(pts, leaf=0.03):
     if pts.size == 0: return pts
     grid = np.floor(pts[:, :3] / leaf).astype(np.int64)
@@ -197,6 +214,19 @@ def height_band(pts, zmin=0.1, zmax=2.4):
     m = (pts[:,2] >= zmin) & (pts[:,2] <= zmax)
     return pts[m]
 
+# ----- New: PCA alignment (orthogonal snap) -----
+def pca_align(xy: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Rotate XY so the first PC aligns with X axis; returns (rotated_xy, angle_deg)."""
+    xy0 = xy - xy.mean(0, keepdims=True)
+    U, S, Vt = np.linalg.svd(xy0, full_matrices=False)
+    R = Vt.T  # principal axes as columns
+    rot = np.arctan2(R[1,0], R[0,0])  # angle of first PC
+    c, s = np.cos(-rot), np.sin(-rot)
+    R2 = np.array([[c, -s],[s, c]])
+    xy_rot = (xy - xy.mean(0)) @ R2.T
+    return xy_rot, np.degrees(rot)
+
+# ----- Grid & vectorization -----
 def to_grid(xy, res=DEFAULT_RES_M, pad_ratio=0.02):
     min_xy = xy.min(axis=0); max_xy = xy.max(axis=0)
     pad = np.maximum((max_xy - min_xy) * pad_ratio, [0.2, 0.2])
@@ -212,15 +242,18 @@ def to_grid(xy, res=DEFAULT_RES_M, pad_ratio=0.02):
     grid[ij[:,1], ij[:,0]] = 255
     return grid, GridMeta(origin_xy=min_xy, res=float(res), shape=(H, W))
 
-def wall_mask_from_points(grid, dil=2):
+def wall_mask_from_points(grid, dil=2, close=1):
     k = cv2.getStructuringElement(cv2.MORPH_RECT, (max(1, dil), max(1, dil)))
     wall = cv2.dilate(grid, k, iterations=1)
+    if close > 0:
+        k2 = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+        wall = cv2.morphologyEx(wall, cv2.MORPH_CLOSE, k2, iterations=close)
     return cv2.threshold(wall, 128, 255, cv2.THRESH_BINARY)[1]
 
-def extract_lines(wall_mask, min_len_px=60, theta_res=np.pi/180, rho_res=1, thresh=80):
+def extract_lines(wall_mask, min_len_px=60, theta_res=np.pi/180, rho_res=1, thresh=80, max_gap=8):
     edges = cv2.Canny(wall_mask, 50, 150, apertureSize=3)
     lines = cv2.HoughLinesP(edges, rho=rho_res, theta=theta_res, threshold=thresh,
-                            minLineLength=min_len_px, maxLineGap=8)
+                            minLineLength=min_len_px, maxLineGap=max_gap)
     out = []
     if lines is not None:
         for l in lines[:,0]:
@@ -228,19 +261,26 @@ def extract_lines(wall_mask, min_len_px=60, theta_res=np.pi/180, rho_res=1, thre
             out.append((x1,y1,x2,y2))
     return out, edges
 
-def merge_collinear(lines, angle_tol_deg=5):
+def merge_collinear(lines: List[Tuple[int,int,int,int]], angle_tol_deg=5, snap_ortho=False):
     if not lines: return []
-    def angle(l): x1,y1,x2,y2=l; return math.degrees(math.atan2(y2-y1, x2-x1)) % 180
+    def angle(l): x1,y1,x2,y2=l; return (math.degrees(math.atan2(y2-y1, x2-x1)) + 180) % 180
     used = [False]*len(lines); merged=[]
     for i,l in enumerate(lines):
         if used[i]: continue
-        ag = angle(l); pts=[(l[0],l[1]),(l[2],l[3])]; used[i]=True
+        ag = angle(l)
+        # optional snapping to 0/90
+        if snap_ortho:
+            ag = 0 if min(abs(ag-0), abs(ag-180)) < 45 else 90
+        pts=[(l[0],l[1]),(l[2],l[3])]; used[i]=True
         for j,m in enumerate(lines):
             if used[j]: continue
             am = angle(m)
+            if snap_ortho:
+                am = 0 if min(abs(am-0), abs(am-180)) < 45 else 90
             if min(abs(am-ag), abs(abs(am-ag)-180)) <= angle_tol_deg:
                 pts += [(m[0],m[1]),(m[2],m[3])]; used[j]=True
         xs=[p[0] for p in pts]; ys=[p[1] for p in pts]
+        # orientation proxy
         if abs(math.sin(math.radians(ag))) < 0.5:
             ymed=int(np.median(ys)); merged.append((min(xs), ymed, max(xs), ymed))
         else:
@@ -263,13 +303,15 @@ def detect_doors(wall_mask, res, default_m=(0.8, 1.2)):
             doors.append((x + w//2, y + h//2, span))
     return doors
 
-def overlay(wall_mask, lines, doors):
-    color = np.dstack([wall_mask]*3)
+def overlay(wall_mask, lines, doors, alpha=0.65):
+    base = cv2.normalize(wall_mask, None, 0, 255, cv2.NORM_MINMAX)
+    color = np.dstack([base, base, base])
+    overlay_img = color.copy()
     for (x1,y1,x2,y2) in lines:
-        cv2.line(color, (x1,y1), (x2,y2), (0,255,0), 2)
+        cv2.line(overlay_img, (x1,y1), (x2,y2), (0,255,0), 2)
     for (cx,cy,span) in doors:
-        cv2.circle(color, (cx,cy), max(2, span//6), (0,0,255), 2)
-    return color
+        cv2.circle(overlay_img, (cx,cy), max(2, span//6), (0,0,255), 2)
+    return cv2.addWeighted(overlay_img, alpha, color, 1-alpha, 0)
 
 def px_to_m(p, meta: GridMeta):
     x_px, y_px = p
@@ -294,52 +336,111 @@ def export_svg(lines, doors, meta: GridMeta):
         layer_doors.add(dwg.circle(center=(xm, ym), r=r))
     return dwg.tostring().encode("utf-8")
 
-# ---------------- UI ----------------
+# ======= NEW: GeoJSON export for walls & doors =======
+def export_geojson(lines, doors, meta: GridMeta) -> Dict:
+    feats = []
+    for (x1,y1,x2,y2) in lines:
+        x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
+        y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
+        y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
+        feats.append({
+            "type":"Feature",
+            "properties":{"type":"wall"},
+            "geometry":{"type":"LineString","coordinates":[[x1m,y1m],[x2m,y2m]]}
+        })
+    for (cx,cy,span) in doors:
+        xm, ym = px_to_m((cx,cy), meta)
+        ym = meta.origin_xy[1] + (meta.shape[0]-cy)*meta.res
+        feats.append({
+            "type":"Feature",
+            "properties":{"type":"door","span_m": float(span*meta.res)},
+            "geometry":{"type":"Point","coordinates":[xm,ym]}
+        })
+    return {"type":"FeatureCollection","features":feats}
+
+# ==================== Sidebar (flashy) ====================
 st.title(TITLE)
 with st.sidebar:
     st.header("Data")
-    mode = st.radio("Source", ["Upload", "Demo"], index=1)
+    source_col1, source_col2 = st.columns([1,1])
+    with source_col1:
+        mode = st.radio("Source", ["Upload", "Demo"], index=1, horizontal=True)
+    with source_col2:
+        theme = st.selectbox("Theme", ["Auto","Light","Dark"], index=0)
+    if theme == "Light":
+        st.markdown("""
+        <style>body{--bg:#ffffff}</style>
+        """, unsafe_allow_html=True)
+    elif theme == "Dark":
+        st.markdown("""
+        <style>:root{color-scheme:dark;}</style>
+        """, unsafe_allow_html=True)
+
     if mode == "Upload":
-        up = st.file_uploader("Point cloud", type=["ply","pcd","npz","csv","txt"])
+        up = st.file_uploader("Point cloud", type=["ply","pcd","npz","csv","txt"], accept_multiple_files=False)
+        if up is None:
+            st.info("Choose a file to enable Run.")
     else:
         demo_name = st.selectbox("Demo scene", ["Studio", "2BHK", "Corridor network"], index=1)
         demo_seed = st.number_input("Seed", 0, 9999, 42)
 
     st.header("Preprocess")
-    voxel = st.slider("Voxel (m)", 0.005, 0.10, 0.03, 0.005)
-    density_cell = st.slider("Outlier cell (m)", 0.02, 0.20, 0.06, 0.01)
-    density_min = st.slider("Min pts/cell", 1, 10, 3, 1)
+    preset = st.selectbox("Presets", ["Default","WallsDense","Loose"], index=0,
+                          help="Quickly set typical filter strengths")
+    voxel = st.slider("Voxel (m)", 0.005, 0.10, 0.03 if preset=="Default" else (0.02 if preset=="WallsDense" else 0.05), 0.005)
+    density_cell = st.slider("Outlier cell (m)", 0.02, 0.20, 0.06 if preset=="Default" else (0.05 if preset=="WallsDense" else 0.10), 0.01)
+    density_min = st.slider("Min pts/cell", 1, 10, 3 if preset=="Default" else (4 if preset=="WallsDense" else 2), 1)
     zmin = st.number_input("z_min (m)", 0.0, 1.0, 0.10, 0.05)
     zmax = st.number_input("z_max (m)", 1.5, 4.0, 2.40, 0.05)
-    auto_relax = st.checkbox("Auto-relax if too sparse", value=True)
+    auto_relax = st.checkbox("Auto‑relax if too sparse", value=True)
+
+    st.header("ROI & Alignment")
+    use_percent_roi = st.checkbox("Crop by percentiles", value=False)
+    p_lo, p_hi = st.slider("XY keep percentiles", 0, 100, (5,95)) if use_percent_roi else (5,95)
+    do_pca_align = st.checkbox("Align to dominant axes (PCA)", value=True)
 
     st.header("Grid / Vectorization")
     res = st.slider("Grid res (m/px)", 0.01, 0.10, DEFAULT_RES_M, 0.01)
     dil = st.slider("Wall dilation (px)", 1, 7, 2, 1)
+    morph_close = st.slider("Morph close iters", 0, 4, 1, 1)
     min_len = st.slider("Min line length (px)", 10, 200, 60, 5)
+    max_gap = st.slider("Max line gap (px)", 0, 50, 8, 1)
     hough_thresh = st.slider("Hough threshold", 10, 200, 80, 5)
     angle_merge = st.slider("Merge angle tol (deg)", 1, 15, 5, 1)
+    snap_ortho = st.checkbox("Snap merge to 0/90°", value=True)
 
     st.header("3D View")
     engine = st.selectbox("Engine", ["Plotly", "PyDeck"], index=0)
     point_size = st.slider("Point size", 1, 8, 2, 1)
     color_mode = st.selectbox("Color by", ["height(z)", "density"], index=0)
 
-    run = st.button("Run pipeline", type="primary")
+    run = st.button("Run pipeline 🚀", type="primary", use_container_width=True)
 
-# ---------------- Pipeline ----------------
+# ==================== Pipeline ====================
 if mode == "Upload" and not run:
     st.info("Upload a file and click Run.")
 elif mode == "Demo" and not run:
     st.info("Pick a demo and click Run.")
 
 if run:
-    with st.spinner("Preparing data"):
-        pts = load_cloud(up) if mode == "Upload" else demo_scene(demo_name, seed=int(demo_seed))
+    with st.spinner("Preparing data…"):
+        if mode == "Upload":
+            if "up" not in locals() or up is None:
+                st.error("No file selected."); st.stop()
+            pts = load_cloud(up)
+        else:
+            pts = _cached_demo(demo_name, int(demo_seed))
         if pts.ndim != 2 or pts.shape[1] < 3: st.error("Expect Nx3 points [x,y,z]."); st.stop()
         orig_n = len(pts)
         if orig_n > MAX_POINTS:
             step = int(np.ceil(orig_n / MAX_POINTS)); pts = pts[::step]
+
+        # ROI crop (percentile window in XY)
+        if use_percent_roi:
+            lo = np.percentile(pts[:,:2], p_lo, axis=0)
+            hi = np.percentile(pts[:,:2], p_hi, axis=0)
+            m = (pts[:,0]>=lo[0]) & (pts[:,0]<=hi[0]) & (pts[:,1]>=lo[1]) & (pts[:,1]<=hi[1])
+            pts = pts[m]
 
         # preprocess
         pts = voxel_downsample(pts, leaf=float(voxel))
@@ -362,88 +463,152 @@ if run:
             st.error("Too few points after filtering. Loosen filters."); st.stop()
 
         xy = band[:, :2]
+
+        rotation_deg = 0.0
+        if do_pca_align:
+            xy, rotation_deg = pca_align(xy)
+
         grid, meta = to_grid(xy, res=float(res))
-        wall = wall_mask_from_points(grid, dil=int(dil))
-        lines_raw, _ = extract_lines(wall, min_len_px=int(min_len), theta_res=np.pi/180, rho_res=1, thresh=int(hough_thresh))
-        lines = merge_collinear(lines_raw, angle_tol_deg=int(angle_merge))
+        meta.rotation_deg = float(rotation_deg)
+        wall = wall_mask_from_points(grid, dil=int(dil), close=int(morph_close))
+        lines_raw, edges = extract_lines(wall, min_len_px=int(min_len), theta_res=np.pi/180, rho_res=1, thresh=int(hough_thresh), max_gap=int(max_gap))
+        lines = merge_collinear(lines_raw, angle_tol_deg=int(angle_merge), snap_ortho=bool(snap_ortho))
         doors = detect_doors(wall, res=meta.res)
-        overlay_img = overlay(wall, lines, doors)
+        overlay_img = overlay(wall, lines, doors, alpha=0.7)
 
-    # --------------- Visuals ---------------
-    col1, col2 = st.columns([1,1])
+        # thickness estimate via distance transform
+        inv = 255 - wall
+        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+        wall_thickness_px = float(np.percentile(dist[wall>0], 90)) if np.any(wall>0) else 0.0
+        wall_thickness_m = wall_thickness_px * meta.res * 2
 
-    with col1:
-        st.subheader("3D view")
-        # sample for speed
-        samp = band[np.random.choice(len(band), size=min(SAMPLE_FOR_VIEW, len(band)), replace=False)]
-        if color_mode == "height(z)":
-            cvals = samp[:,2]
-        else:
-            # density by 2D binning
-            xy_ = samp[:,:2]
-            res_d = max(DEFAULT_RES_M, float(res))
-            ij = np.floor((xy_ - xy_.min(0))/res_d).astype(int)
-            keys = ij[:,0]*73856093 ^ ij[:,1]*19349663
-            _, inv, cnts = np.unique(keys, return_inverse=True, return_counts=True)
-            cvals = cnts[inv]
+    # ---------------------- Visuals (tabs) ----------------------
+    t1, t2, t3 = st.tabs(["3D / Top‑down", "2D Layers", "Analytics & Exports"])
 
-        if engine == "Plotly":
-            fig = go.Figure(data=[go.Scatter3d(
-                x=samp[:,0], y=samp[:,1], z=samp[:,2],
-                mode='markers',
-                marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.9, colorbar=dict(len=0.6))
-            )])
-            fig.update_layout(scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
-                                         aspectmode='data'),
-                              margin=dict(l=0,r=0,t=0,b=0), height=520)
-            st.plotly_chart(fig, use_container_width=True)
-        else:
-            # PyDeck PointCloudLayer with z-based color
-            z = cvals.astype(float)
-            zmin_, zmax_ = float(z.min()), float(z.max()) if z.size else (0.0, 1.0)
-            if zmax_ == zmin_: zmax_ = zmin_ + 1.0
-            zn = (z - zmin_) / (zmax_ - zmin_ + 1e-9)
-            colors = np.stack([(zn*255).astype(int), (1-zn)*255, np.full_like(zn, 180, dtype=int)], axis=1)
-            data = [{"position":[float(x),float(y),float(zv)], "color":[int(r),int(g),int(b)]}
-                    for (x,y,zv),(r,g,b) in zip(samp, colors)]
-            layer = pdk.Layer("PointCloudLayer", data=data, get_position="position",
-                              get_color="color", point_size=point_size, pickable=False)
-            deck = pdk.Deck(layers=[layer],
-                            initial_view_state=pdk.ViewState(x=0, y=0, z=0, zoom=0.5, pitch=45),
-                            map_provider=None)
-            st.pydeck_chart(deck, use_container_width=True)
+    with t1:
+        col1, col2 = st.columns([1,1])
+        with col1:
+            st.subheader("3D view")
+            # sample for speed
+            samp = band[np.random.choice(len(band), size=min(SAMPLE_FOR_VIEW, len(band)), replace=False)]
+            if color_mode == "height(z)":
+                cvals = samp[:,2]
+            else:
+                # density by 2D binning
+                xy_ = samp[:,:2]
+                res_d = max(DEFAULT_RES_M, float(res))
+                ij = np.floor((xy_ - xy_.min(0))/res_d).astype(int)
+                keys = ij[:,0]*73856093 ^ ij[:,1]*19349663
+                _, invk, cnts = np.unique(keys, return_inverse=True, return_counts=True)
+                cvals = cnts[invk]
 
-        st.caption(f"Loaded: {orig_n:,} pts → kept: {pts.shape[0]:,}. Band used: {band.shape[0]:,}.")
+            if engine == "Plotly":
+                fig = go.Figure(data=[go.Scatter3d(
+                    x=samp[:,0], y=samp[:,1], z=samp[:,2],
+                    mode='markers',
+                    marker=dict(size=point_size, color=cvals, colorscale='Viridis', opacity=0.9, colorbar=dict(len=0.6))
+                )])
+                fig.update_layout(scene=dict(xaxis_title='x', yaxis_title='y', zaxis_title='z',
+                                             aspectmode='data'),
+                                  margin=dict(l=0,r=0,t=0,b=0), height=520)
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                # PyDeck PointCloudLayer with z-based color
+                z = cvals.astype(float)
+                zmin_, zmax_ = float(z.min()), float(z.max()) if z.size else (0.0, 1.0)
+                if zmax_ == zmin_: zmax_ = zmin_ + 1.0
+                zn = (z - zmin_) / (zmax_ - zmin_ + 1e-9)
+                colors = np.stack([(zn*255).astype(int), (1-zn)*255, np.full_like(zn, 180, dtype=int)], axis=1)
+                data = [{"position":[float(x),float(y),float(zv)], "color":[int(r),int(g),int(b)]}
+                        for (x,y,zv),(r,g,b) in zip(samp, colors)]
+                layer = pdk.Layer("PointCloudLayer", data=data, get_position="position",
+                                  get_color="color", point_size=point_size, pickable=False)
+                deck = pdk.Deck(layers=[layer],
+                                initial_view_state=pdk.ViewState(x=0, y=0, z=0, zoom=0.5, pitch=45),
+                                map_provider=None)
+                st.pydeck_chart(deck, use_container_width=True)
 
-    with col2:
-        st.subheader("2D layers")
-        st.image(wall, caption="Wall mask", use_container_width=True, clamp=True)
-        st.image(overlay_img, caption="Vector overlay (green=walls, red≈doors)", use_container_width=True, clamp=True)
+            st.caption(f"Loaded: {orig_n:,} pts → kept: {pts.shape[0]:,}. Band used: {band.shape[0]:,}.")
 
-    # --------------- Metrics ---------------
-    st.subheader("Metrics")
-    st.write({
-        "grid_size_px": meta.shape,
-        "grid_resolution_m_per_px": meta.res,
-        "lines_detected": len(lines),
-        "door_candidates": len(doors),
-    })
+        with col2:
+            st.subheader("Top‑down scatter (interactive)")
+            # Use aligned XY if PCA alignment is enabled; otherwise original XY band
+            xy_show = xy
+            fig2 = px.scatter(x=xy_show[:,0], y=xy_show[:,1], render_mode="webgl", opacity=0.7)
+            fig2.update_traces(marker=dict(size=2))
+            fig2.update_layout(xaxis_title="x (m)", yaxis_title="y (m)", height=520, margin=dict(l=0,r=0,t=0,b=0))
+            st.plotly_chart(fig2, use_container_width=True)
 
-    # --------------- Exports ---------------
-    svg_bytes = export_svg(lines, doors, meta)
-    st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml")
-    ok, png_bytes = cv2.imencode(".png", wall)
-    if ok:
-        st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png")
+    with t2:
+        colA, colB, colC = st.columns([1,1,1])
+        with colA:
+            st.subheader("Wall mask")
+            st.image(wall, use_container_width=True, clamp=True)
+        with colB:
+            st.subheader("Edges")
+            st.image(edges, use_container_width=True, clamp=True)
+        with colC:
+            st.subheader("Vector overlay")
+            alpha = st.slider("Overlay alpha", 0.1, 1.0, 0.7, 0.05)
+            st.image(overlay(wall, lines, doors, alpha=float(alpha)), use_container_width=True, clamp=True)
 
-    # lines CSV
-    rows = ["x1_m,y1_m,x2_m,y2_m"]
-    for (x1,y1,x2,y2) in lines:
-        x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
-        y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
-        y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
-        rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-    st.download_button("Download wall lines CSV", data=("\n".join(rows)).encode("utf-8"),
-                       file_name="walls.csv", mime="text/csv")
+    with t3:
+        st.subheader("Metrics")
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Grid H×W (px)", f"{meta.shape[0]} × {meta.shape[1]}")
+        m2.metric("Resolution (m/px)", f"{meta.res:.3f}")
+        m3.metric("Lines", len(lines))
+        m4.metric("Doors", len(doors))
+        m5.metric("~Wall thickness (m)", f"{wall_thickness_m:.2f}")
 
-    st.success("Done")
+        st.caption("Rotation applied (PCA): {:.1f}°".format(meta.rotation_deg))
+
+        st.markdown("---")
+        st.subheader("Downloads")
+        # SVG
+        svg_bytes = export_svg(lines, doors, meta)
+        st.download_button("Download SVG plan", data=svg_bytes, file_name="plan.svg", mime="image/svg+xml", use_container_width=True)
+        # Wall PNG
+        ok, png_bytes = cv2.imencode(".png", wall)
+        if ok:
+            st.download_button("Download wall mask PNG", data=png_bytes.tobytes(), file_name="wall_mask.png", mime="image/png", use_container_width=True)
+        # Lines CSV
+        rows = ["x1_m,y1_m,x2_m,y2_m"]
+        for (x1,y1,x2,y2) in lines:
+            x1m,y1m = px_to_m((x1,y1), meta); x2m,y2m = px_to_m((x2,y2), meta)
+            y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
+            y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
+            rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
+        st.download_button("Download wall lines CSV", data=("\n".join(rows)).encode("utf-8"), file_name="walls.csv", mime="text/csv", use_container_width=True)
+        # GeoJSON
+        gj = export_geojson(lines, doors, meta)
+        st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
+
+        st.markdown("---")
+        st.subheader("Analytics")
+        with st.expander("Height histogram (band)"):
+            hist = np.histogram(band[:,2], bins=40)
+            fig_h = go.Figure(data=[go.Bar(x=(hist[1][:-1]+hist[1][1:])/2, y=hist[0])])
+            fig_h.update_layout(xaxis_title="z (m)", yaxis_title="count", height=260, margin=dict(l=0,r=0,t=0,b=0))
+            st.plotly_chart(fig_h, use_container_width=True)
+        with st.expander("Occupancy heatmap"):
+            H, W = meta.shape
+            heat = cv2.GaussianBlur(wall, (0,0), 1)
+            fig_hm = px.imshow(heat, origin='upper')
+            fig_hm.update_layout(coloraxis_showscale=False, height=300, margin=dict(l=0,r=0,t=0,b=0))
+            st.plotly_chart(fig_hm, use_container_width=True)
+
+    # Footer ribbon
+    st.markdown(
+        """
+        <div style="position:fixed;right:16px;bottom:16px;background:#111827;color:#e5e7eb;padding:8px 12px;border-radius:12px;opacity:0.9;font-size:12px;">
+          Built with ❤️ Streamlit • CV2 • Plotly • PyDeck
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("About this demo"):
+        st.write(
+            "This flashy v2 adds PCA alignment, ROI cropping, better morphology controls, analytics, GeoJSON export, and interactive tabs."
+        )
