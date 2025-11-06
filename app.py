@@ -12,7 +12,10 @@ import pydeck as pdk
 
 # ==================== App config ====================
 st.set_page_config(page_title="LiDAR → Floor Plan", layout="wide")
-TITLE = "LiDAR → 2D Floor‑Plan Extractor (v4 • Demo‑only • Auto‑run)"
+# Avoid creating many inotify watchers on Streamlit Cloud
+st.set_option("server.fileWatcherType", "none")
+
+TITLE = "LiDAR → 2D Floor‑Plan Extractor (v5 • Demo‑only • Auto‑run)"
 MAX_POINTS = 1_000_000
 SAMPLE_FOR_VIEW = 160_000
 DEFAULT_RES_M = 0.03
@@ -426,8 +429,8 @@ with t3:
         y1m = meta.origin_xy[1] + (meta.shape[0]-y1)*meta.res
         y2m = meta.origin_xy[1] + (meta.shape[0]-y2)*meta.res
         rows.append(f"{x1m:.3f},{y1m:.3f},{x2m:.3f},{y2m:.3f}")
-    csv_bytes = ("
-".join(rows)).encode("utf-8")
+    csv_text = "\n".join(rows)
+    csv_bytes = csv_text.encode("utf-8")
     st.download_button("Download wall lines CSV", data=csv_bytes, file_name="walls.csv", mime="text/csv", use_container_width=True)
     gj = export_geojson(lines, doors, meta)
     st.download_button("Download GeoJSON", data=json.dumps(gj, indent=2).encode("utf-8"), file_name="plan.geojson", mime="application/geo+json", use_container_width=True)
@@ -448,5 +451,5 @@ st.markdown(
 
 with st.expander("About this demo"):
     st.write(
-        "This v4 build removes uploads and buttons, auto‑runs the demo, and focuses on high‑polish visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
+        "This v5 build removes uploads and buttons, auto‑runs the demo, disables file watchers to avoid inotify limits, and focuses on high‑polish visuals: controllable 3D camera, heatmap, PCA alignment, ROI cropping, analytics, and multiple export formats."
     )
